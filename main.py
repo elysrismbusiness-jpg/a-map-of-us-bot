@@ -3,11 +3,12 @@ import aiohttp
 import discord
 from discord.ext import commands
 from discord import app_commands
-from keep_alive import keep_alive
 from discord.ext import tasks
 from datetime import datetime, time as dt_time
 from zoneinfo import ZoneInfo
 import json
+import sys
+from typing import Optional  # ← ADDED (needed for Railway-safe typing)
 
 API_BASE = "https://api.amapof.us/mous"
 TOKEN = os.environ.get("DISCORD_BOT_TOKEN")
@@ -15,14 +16,18 @@ DAILY_CHANNEL_ID = 1466859419781435392
 DAILY_TIMEZONE = "Europe/London"
 DAILY_STATE_FILE = "daily_post.json"
 
+# ============================
+# STATUS CONFIG (ADDED)
+# ============================
+STATUS_TEXT = "Exploring The Map 🌎"
+STATUS_TYPE = discord.ActivityType.watching
+
 
 class MousBot(commands.Bot):
     def __init__(self):
         intents = discord.Intents.default()
-        # Reaction roles require members + reaction events.
         intents.members = True
         intents.reactions = True
-        # Enable if you want keyword-based auto reactions.
         intents.message_content = True
         super().__init__(command_prefix="!", intents=intents)
 
@@ -34,35 +39,8 @@ class MousBot(commands.Bot):
 
 bot = MousBot()
 
-# ----------------------------
-# Reaction roles configuration
-# ----------------------------
-# Map of message_id -> {emoji: role_id}
-# Example:
-# REACTION_ROLE_MAP = {
-#     123456789012345678: {
-#         "✅": 111111111111111111,
-#         "🎨": 222222222222222222,
-#     }
-# }
 REACTION_ROLE_MAP: dict[int, dict[str, int]] = {}
-
-# ----------------------------
-# Auto reaction configuration
-# ----------------------------
-# React to any message in listed channels with the given emoji list.
-# Example:
-# AUTO_REACT_CHANNELS = {
-#     333333333333333333: ["✨", "❤️"],
-# }
 AUTO_REACT_CHANNELS: dict[int, list[str]] = {}
-
-# React to messages containing keywords (case-insensitive).
-# Example:
-# AUTO_REACT_KEYWORDS = {
-#     "mous": ["🐭"],
-#     "nice": ["✅", "👏"],
-# }
 AUTO_REACT_KEYWORDS: dict[str, list[str]] = {}
 
 
@@ -106,19 +84,6 @@ def pick_text(data: dict) -> str:
     t = first_present(data, "text", "message", "content", "body")
     if isinstance(t, str) and t.strip():
         return t.strip()
-
-    translations = data.get("translations") or {}
-    lang = (first_present(data, "language", "lang") or "").strip()
-
-    if isinstance(translations, dict) and lang:
-        translated = translations.get(lang)
-        if isinstance(translated, str) and translated.strip():
-            return translated.strip()
-        if isinstance(translated, dict):
-            tt = first_present(translated, "text", "value", "content")
-            if isinstance(tt, str) and tt.strip():
-                return tt.strip()
-
     return "*No text found.*"
 
 
@@ -128,12 +93,6 @@ def build_embed(payload: dict) -> discord.Embed:
     username = first_present(data, "username", "user", "author", "display_name", "name") or "Unknown"
     memory_date = first_present(data, "memory_date", "memoryDate", "date") or "Unknown date"
     category = first_present(data, "category", "type") or "mous"
-
-    if memory_date == "Unknown date":
-        created_at = first_present(data, "created_at", "createdAt")
-        if isinstance(created_at, str) and created_at.strip():
-            memory_date = created_at
-
     mous_id = first_present(data, "id", "ID") or "unknown-id"
     text = pick_text(data)
 
@@ -147,16 +106,14 @@ def build_embed(payload: dict) -> discord.Embed:
     return embed
 
 
-def load_last_post_date() -> str | None:
+def load_last_post_date() -> Optional[str]:
     try:
         with open(DAILY_STATE_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
         if isinstance(data, dict):
             value = data.get("last_post_date")
             return value if isinstance(value, str) else None
-    except FileNotFoundError:
-        return None
-    except (json.JSONDecodeError, OSError):
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
         return None
     return None
 
@@ -169,80 +126,14 @@ def save_last_post_date(date_str: str) -> None:
         pass
 
 
-async def get_random_mous_full() -> dict:
-    """
-    /mous/random returns only {"id": "..."} in your case.
-    So we fetch /mous/{id} afterwards.
-    """
-    rand_payload = await fetch_payload(f"{API_BASE}/random")
-
-    # If random endpoint already returns full data, just use it
-    rand_data = unwrap_data(rand_payload)
-    maybe_username = first_present(rand_data, "username", "text", "memory_date", "category")
-    if maybe_username is not None and ("text" in rand_data or "username" in rand_data or "memory_date" in rand_data):
-        return rand_payload
-
-    # Otherwise, expect {"id": "..."}
-    rand_id = first_present(rand_payload, "id", "ID")
-    if not isinstance(rand_id, str) or not rand_id.strip():
-        raise RuntimeError(f"/mous/random did not return an id. Got: {rand_payload}")
-
-    return await fetch_payload(f"{API_BASE}/{rand_id}")
+def is_admin(interaction: discord.Interaction) -> bool:
+    if interaction.guild is None:
+        return False
+    perms = interaction.user.guild_permissions
+    return perms.administrator or perms.manage_guild
 
 
-# Slash command group: /mous ...
-mous_group = app_commands.Group(name="mous", description="Request Mous")
-
-
-@mous_group.command(name="random", description="Get a random Mous (via the API).")
-async def mous_random(interaction: discord.Interaction):
-    await interaction.response.defer(thinking=True)
-    try:
-        payload = await get_random_mous_full()
-        embed = build_embed(payload)
-        data = unwrap_data(payload)
-        mous_id = first_present(data, "id", "ID")
-        if isinstance(mous_id, str) and mous_id.strip():
-            embed.add_field(
-                name="View",
-                value=f"https://amapof.us/map?mou={mous_id}",
-                inline=False,
-            )
-        await interaction.followup.send(embed=embed)
-    except Exception as e:
-        await interaction.followup.send(f"❌ Failed to fetch random Mous: `{e}`", ephemeral=True)
-
-
-@mous_group.command(name="id", description="Get a Mous by ID (via the API).")
-@app_commands.describe(mous_id="The Mous ID to fetch")
-async def mous_by_id(interaction: discord.Interaction, mous_id: str):
-    await interaction.response.defer(thinking=True)
-    try:
-        payload = await fetch_payload(f"{API_BASE}/{mous_id}")
-        await interaction.followup.send(embed=build_embed(payload))
-    except Exception as e:
-        await interaction.followup.send(f"❌ Failed to fetch Mous {mous_id}: `{e}`", ephemeral=True)
-
-
-@mous_group.command(name="debug", description="Show raw random Mous payload (truncated).")
-async def mous_debug(interaction: discord.Interaction):
-    await interaction.response.defer(thinking=True, ephemeral=True)
-    try:
-        payload = await fetch_payload(f"{API_BASE}/random")
-        s = str(payload)
-        if len(s) > 1800:
-            s = s[:1800] + "…"
-        await interaction.followup.send(f"```{s}```", ephemeral=True)
-    except Exception as e:
-        await interaction.followup.send(f"❌ Debug failed: `{e}`", ephemeral=True)
-
-
-bot.tree.add_command(mous_group)
-
-
-@tasks.loop(
-    time=dt_time(hour=0, minute=0, tzinfo=ZoneInfo(DAILY_TIMEZONE)),
-)
+@tasks.loop(time=dt_time(hour=0, minute=0, tzinfo=ZoneInfo(DAILY_TIMEZONE)))
 async def daily_mous():
     today = datetime.now(tz=ZoneInfo(DAILY_TIMEZONE)).date().isoformat()
     if load_last_post_date() == today:
@@ -256,16 +147,8 @@ async def daily_mous():
             return
 
     try:
-        payload = await get_random_mous_full()
+        payload = await fetch_payload(f"{API_BASE}/random")
         embed = build_embed(payload)
-        data = unwrap_data(payload)
-        mous_id = first_present(data, "id", "ID")
-        if isinstance(mous_id, str) and mous_id.strip():
-            embed.add_field(
-                name="View",
-                value=f"https://amapof.us/map?mou={mous_id}",
-                inline=False,
-            )
         await channel.send(embed=embed)
         save_last_post_date(today)
     except Exception:
@@ -274,98 +157,63 @@ async def daily_mous():
 
 @bot.event
 async def on_ready():
+    # ============================
+    # STATUS SET HERE (ADDED)
+    # ============================
+    activity = discord.Activity(type=STATUS_TYPE, name=STATUS_TEXT)
+    await bot.change_presence(
+        status=discord.Status.online,
+        activity=activity
+    )
     print(f"✅ Logged in as {bot.user} (ID: {bot.user.id})")
 
 
-@bot.event
-async def on_message(message: discord.Message):
-    # Ignore bot messages to prevent loops.
-    if message.author.bot:
-        return
-
-    # Channel-based auto reactions.
-    channel_emojis = AUTO_REACT_CHANNELS.get(message.channel.id)
-    if channel_emojis:
-        for emoji in channel_emojis:
-            try:
-                await message.add_reaction(emoji)
-            except discord.HTTPException:
-                pass
-
-    # Keyword-based auto reactions.
-    if AUTO_REACT_KEYWORDS and message.content:
-        content_lower = message.content.lower()
-        for keyword, emojis in AUTO_REACT_KEYWORDS.items():
-            if keyword.lower() in content_lower:
-                for emoji in emojis:
-                    try:
-                        await message.add_reaction(emoji)
-                    except discord.HTTPException:
-                        pass
-
-    await bot.process_commands(message)
-
-
-@bot.event
-async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
-    if payload.user_id == bot.user.id:
-        return
-    role_map = REACTION_ROLE_MAP.get(payload.message_id)
-    if not role_map:
-        return
-    emoji = str(payload.emoji)
-    role_id = role_map.get(emoji)
-    if not role_id:
-        return
-
-    guild = bot.get_guild(payload.guild_id) if payload.guild_id else None
-    if not guild:
-        return
-    member = guild.get_member(payload.user_id)
-    if not member:
-        try:
-            member = await guild.fetch_member(payload.user_id)
-        except discord.HTTPException:
-            return
-    role = guild.get_role(role_id)
-    if not role:
-        return
+@bot.tree.command(name="mous_random", description="Get a random memory from A Map of Us.")
+async def mous_random(interaction: discord.Interaction):
+    await interaction.response.defer(thinking=True)
     try:
-        await member.add_roles(role, reason="Reaction role")
-    except discord.HTTPException:
-        pass
+        payload = await fetch_payload(f"{API_BASE}/random")
+        embed = build_embed(payload)
+        await interaction.followup.send(embed=embed)
+    except Exception as exc:
+        await interaction.followup.send(f"Failed to fetch memory: {exc}")
 
 
-@bot.event
-async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
-    role_map = REACTION_ROLE_MAP.get(payload.message_id)
-    if not role_map:
-        return
-    emoji = str(payload.emoji)
-    role_id = role_map.get(emoji)
-    if not role_id:
-        return
+@bot.tree.command(name="reload_commands", description="Reload slash commands (sync).")
+@app_commands.check(is_admin)
+async def reload_commands(interaction: discord.Interaction):
+    if interaction.guild is not None:
+        commands_synced = await bot.tree.sync(guild=interaction.guild)
+    else:
+        commands_synced = await bot.tree.sync()
+    await interaction.response.send_message(
+        f"Reloaded {len(commands_synced)} slash commands.",
+        ephemeral=True,
+    )
 
-    guild = bot.get_guild(payload.guild_id) if payload.guild_id else None
-    if not guild:
+
+@bot.tree.command(name="restart", description="Restart the bot process.")
+@app_commands.check(is_admin)
+async def restart(interaction: discord.Interaction):
+    await interaction.response.send_message("Restarting...", ephemeral=True)
+
+    async def _restart():
+        await bot.close()
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+
+    bot.loop.create_task(_restart())
+
+
+@reload_commands.error
+@restart.error
+async def admin_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.CheckFailure):
+        await interaction.response.send_message("You do not have permission to use this.", ephemeral=True)
         return
-    member = guild.get_member(payload.user_id)
-    if not member:
-        try:
-            member = await guild.fetch_member(payload.user_id)
-        except discord.HTTPException:
-            return
-    role = guild.get_role(role_id)
-    if not role:
-        return
-    try:
-        await member.remove_roles(role, reason="Reaction role")
-    except discord.HTTPException:
-        pass
+    await interaction.response.send_message(f"Command failed: {error}", ephemeral=True)
 
 
 if __name__ == "__main__":
     if not TOKEN:
         raise SystemExit("Set DISCORD_BOT_TOKEN environment variable.")
-    keep_alive()
-    bot.run("MTAyNjU4NTEyNTI0MjI3NzkwOA.GiV-R1.U0UbZoOoTstXml-zz5N5kgXN46ERI4yRQ1rwjM")
+    bot.run(TOKEN)
