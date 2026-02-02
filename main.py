@@ -1,5 +1,6 @@
 import os
 import aiohttp
+from aiohttp import web
 import discord
 from discord.ext import commands
 from discord import app_commands
@@ -15,6 +16,8 @@ TOKEN = os.environ.get("DISCORD_BOT_TOKEN")
 DAILY_CHANNEL_ID = 1466859419781435392
 DAILY_TIMEZONE = "Europe/London"
 DAILY_STATE_FILE = "daily_post.json"
+GUILD_ID = int(os.environ.get("DISCORD_GUILD_ID", "0"))
+HEALTH_RUNNER: Optional[web.AppRunner] = None
 
 # ============================
 # STATUS CONFIG (ADDED)
@@ -32,7 +35,17 @@ class MousBot(commands.Bot):
         super().__init__(command_prefix="!", intents=intents)
 
     async def setup_hook(self):
-        await self.tree.sync()
+        try:
+            if GUILD_ID:
+                guild = discord.Object(id=GUILD_ID)
+                self.tree.copy_global_to(guild=guild)
+                await self.tree.sync(guild=guild)
+            else:
+                await self.tree.sync()
+        except Exception as exc:
+            print(f"[ERROR] Slash command sync failed: {exc}")
+
+        await start_health_server()
         if not daily_mous.is_running():
             daily_mous.start()
 
@@ -131,6 +144,28 @@ def is_admin(interaction: discord.Interaction) -> bool:
         return False
     perms = interaction.user.guild_permissions
     return perms.administrator or perms.manage_guild
+
+
+async def start_health_server() -> None:
+    global HEALTH_RUNNER
+    port_str = os.environ.get("PORT")
+    if not port_str:
+        return
+    if HEALTH_RUNNER is not None:
+        return
+
+    port = int(port_str)
+
+    async def _health(_: web.Request) -> web.Response:
+        return web.Response(text="OK")
+
+    app = web.Application()
+    app.router.add_get("/", _health)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, host="0.0.0.0", port=port)
+    await site.start()
+    HEALTH_RUNNER = runner
 
 
 @tasks.loop(time=dt_time(hour=0, minute=0, tzinfo=ZoneInfo(DAILY_TIMEZONE)))
